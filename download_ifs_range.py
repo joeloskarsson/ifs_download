@@ -19,12 +19,12 @@ from earthkit.data import settings
 MODEL_NAME = os.getenv("MODEL_NAME", "esfm")
 
 
-FIELD_ENV_SPECS: tuple[tuple[str, str, Callable[[str], Any], int | None], ...] = (
-    ("grid", "IFS_GRID", float, 2),
-    ("area", "IFS_AREA", float, 4),
-    ("pressure_levels", "IFS_PRESSURE_LEVELS", int, None),
-    ("pressure_level_params", "IFS_PRESSURE_LEVEL_PARAMS", str, None),
-    ("single_level_params", "IFS_SINGLE_LEVEL_PARAMS", str, None),
+FIELD_ENV_SPECS: tuple[tuple[str, str, Callable[[str], Any], int | None, bool], ...] = (
+    ("grid", "IFS_GRID", float, 2, False),
+    ("area", "IFS_AREA", float, 4, False),
+    ("pressure_levels", "IFS_PRESSURE_LEVELS", int, None, True),
+    ("pressure_level_params", "IFS_PRESSURE_LEVEL_PARAMS", str, None, True),
+    ("single_level_params", "IFS_SINGLE_LEVEL_PARAMS", str, None, False),
 )
 
 
@@ -49,14 +49,15 @@ def _parse_env_list(env_name: str, caster: Callable[[str], Any]) -> list[Any] | 
 
 
 def load_fields_from_env() -> dict[str, list[Any]]:
-    """Load field selection from environment variables (raises if any are missing)."""
+    """Load field selection from environment variables (raises if any required are missing)."""
 
-    fields: dict[str, list[Any]] = {}
+    fields: dict[str, list[Any] | None] = {}
     missing: list[str] = []
-    for key, env_name, caster, expected_len in FIELD_ENV_SPECS:
+    for key, env_name, caster, expected_len, optional in FIELD_ENV_SPECS:
         parsed = _parse_env_list(env_name, caster)
         if parsed is None:
-            missing.append(env_name)
+            if not optional:
+                missing.append(env_name)
             continue
         if expected_len is not None and len(parsed) != expected_len:
             raise ValueError(
@@ -69,6 +70,12 @@ def load_fields_from_env() -> dict[str, list[Any]]:
         raise ValueError(
             f"Missing field configuration via environment variables: {missing_str}. "
             "Set these in config.env before running."
+        )
+
+    pl_keys = ("pressure_levels" in fields, "pressure_level_params" in fields)
+    if pl_keys[0] != pl_keys[1]:
+        raise ValueError(
+            "IFS_PRESSURE_LEVELS and IFS_PRESSURE_LEVEL_PARAMS must both be set or both be empty."
         )
 
     return fields
@@ -137,8 +144,8 @@ def create_fields_file(output_path, fields):
     fields_content = f"""grid: {fields["grid"]}
 area: {fields["area"]}
 
-pressure_levels: {fields["pressure_levels"]}
-pressure_level_params: {fields["pressure_level_params"]}
+pressure_levels: {fields.get("pressure_levels")}
+pressure_level_params: {fields.get("pressure_level_params")}
 
 single_level_params: {fields["single_level_params"]}
 """
@@ -464,9 +471,10 @@ def download_ifs_ensemble(
     try:
         grid = fields["grid"]
         area = fields["area"]
-        pressure_levels = fields["pressure_levels"]
-        pressure_level_params = fields["pressure_level_params"]
+        pressure_levels = fields.get("pressure_levels")
+        pressure_level_params = fields.get("pressure_level_params")
         single_level_params = fields["single_level_params"]
+        download_pl = pressure_levels is not None and pressure_level_params is not None
 
         max_lead_hours = int(os.getenv("MAX_LEAD_TIME_HOURS", str(num_days * 24)))
         if max_lead_hours % interval != 0:
@@ -548,65 +556,68 @@ def download_ifs_ensemble(
             hour_token = init_dt.strftime("%H")
 
             init_step_sets: list[xr.Dataset] = []
-            for step_expr in step_ranges:
-                request_pl = {
-                    "area": area,
-                    "class": "od",
-                    "date": date_token,
-                    "expver": "1",
-                    "grid": grid,
-                    "levtype": "pl",
-                    "levelist": pressure_levels,
-                    "param": pressure_level_params,
-                    "number": number_token,
-                    "step": step_expr,
-                    "stream": "enfo",
-                    "expect": "any",
-                    "time": hour_token,
-                    "type": "pf",
-                }
+            if download_pl:
+                for step_expr in step_ranges:
+                    request_pl = {
+                        "area": area,
+                        "class": "od",
+                        "date": date_token,
+                        "expver": "1",
+                        "grid": grid,
+                        "levtype": "pl",
+                        "levelist": pressure_levels,
+                        "param": pressure_level_params,
+                        "number": number_token,
+                        "step": step_expr,
+                        "stream": "enfo",
+                        "expect": "any",
+                        "time": hour_token,
+                        "type": "pf",
+                    }
 
-                logging.debug(
-                    "Submitting ensemble pressure request for init %s step %s",
-                    init_dt.strftime("%Y-%m-%d %H:%M"),
-                    step_expr,
+                    logging.debug(
+                        "Submitting ensemble pressure request for init %s step %s",
+                        init_dt.strftime("%Y-%m-%d %H:%M"),
+                        step_expr,
+                    )
+
+                    ds_pressure = earthkit.data.from_source("mars", request_pl, lazily=True)
+                    shortnames = list(set(ds_pressure.metadata("shortName")))
+                    has_r = "r" in shortnames
+                    normal_vars = [var for var in shortnames if var != "r"]
+
+                    ds_normal = ds_pressure.sel(shortName=normal_vars).to_xarray(chunks=chunks_pl)
+                    if has_r:
+                        ds_special = ds_pressure.sel(shortName=["r"]).to_xarray(chunks=chunks_pl)
+                        ds_combined = xr.merge([ds_normal, ds_special])
+                    else:
+                        ds_combined = ds_normal
+
+                    log_ds_summary(f"ensemble.raw.pl.{init_dt:%Y%m%d%H}.{step_expr}", ds_combined)
+
+                    ds_combined = ds_combined.chunk(chunks_pl).drop_vars("valid_time", errors="ignore")
+                    ds_combined = rename_and_enrich(
+                        ds_combined,
+                        init_dt=init_dt,
+                    )
+                    ds_combined = cast_float32(ds_combined)
+                    ds_combined = normalize_longitudes(ds_combined)
+                    ds_combined = normalize_latitudes(ds_combined)
+                    if debug_small:
+                        log_ds_summary(f"ensemble.pl.{init_dt:%Y%m%d%H}.{step_expr}", ds_combined)
+                    init_step_sets.append(ds_combined)
+
+                if not init_step_sets:
+                    logging.error("No pressure data retrieved for ensemble init %s", init_dt)
+                    return False
+
+            init_pl: xr.Dataset | None = None
+            if init_step_sets:
+                init_pl = (
+                    xr.concat(init_step_sets, dim="lead_time").sortby("lead_time")
+                    if len(init_step_sets) > 1
+                    else init_step_sets[0]
                 )
-
-                ds_pressure = earthkit.data.from_source("mars", request_pl, lazily=True)
-                shortnames = list(set(ds_pressure.metadata("shortName")))
-                has_r = "r" in shortnames
-                normal_vars = [var for var in shortnames if var != "r"]
-
-                ds_normal = ds_pressure.sel(shortName=normal_vars).to_xarray(chunks=chunks_pl)
-                if has_r:
-                    ds_special = ds_pressure.sel(shortName=["r"]).to_xarray(chunks=chunks_pl)
-                    ds_combined = xr.merge([ds_normal, ds_special])
-                else:
-                    ds_combined = ds_normal
-
-                log_ds_summary(f"ensemble.raw.pl.{init_dt:%Y%m%d%H}.{step_expr}", ds_combined)
-
-                ds_combined = ds_combined.chunk(chunks_pl).drop_vars("valid_time", errors="ignore")
-                ds_combined = rename_and_enrich(
-                    ds_combined,
-                    init_dt=init_dt,
-                )
-                ds_combined = cast_float32(ds_combined)
-                ds_combined = normalize_longitudes(ds_combined)
-                ds_combined = normalize_latitudes(ds_combined)
-                if debug_small:
-                    log_ds_summary(f"ensemble.pl.{init_dt:%Y%m%d%H}.{step_expr}", ds_combined)
-                init_step_sets.append(ds_combined)
-
-            if not init_step_sets:
-                logging.error("No pressure data retrieved for ensemble init %s", init_dt)
-                return False
-
-            init_pl = (
-                xr.concat(init_step_sets, dim="lead_time").sortby("lead_time")
-                if len(init_step_sets) > 1
-                else init_step_sets[0]
-            )
             logging.debug(
                 "Ensemble pressure complete %d/%d for init %s",
                 idx,
@@ -675,11 +686,15 @@ def download_ifs_ensemble(
                     init_dt.strftime("%Y-%m-%d %H:%M"),
                 )
 
-            ds_to_write = (
-                xr.merge([init_pl, ds_surface], compat="no_conflicts")
-                if ds_surface is not None
-                else init_pl
-            )
+            if init_pl is not None and ds_surface is not None:
+                ds_to_write = xr.merge([init_pl, ds_surface], compat="no_conflicts")
+            elif init_pl is not None:
+                ds_to_write = init_pl
+            elif ds_surface is not None:
+                ds_to_write = ds_surface
+            else:
+                logging.error("No data at all for ensemble init %s", init_dt.strftime("%Y-%m-%d %H:%M"))
+                return False
             target_init = np.array([_datetime_to_np64(init_dt)], dtype="datetime64[ns]")
             if "init_time" not in ds_to_write.dims:
                 ds_to_write = ds_to_write.expand_dims("init_time")
@@ -748,9 +763,10 @@ def download_ifs_control(
     try:
         grid = fields["grid"]
         area = fields["area"]
-        pressure_levels = fields["pressure_levels"]
-        pressure_level_params = fields["pressure_level_params"]
+        pressure_levels = fields.get("pressure_levels")
+        pressure_level_params = fields.get("pressure_level_params")
         single_level_params = fields["single_level_params"]
+        download_pl = pressure_levels is not None and pressure_level_params is not None
 
         max_lead_hours = int(os.getenv("MAX_LEAD_TIME_HOURS", str(num_days * 24)))
         if max_lead_hours % interval != 0:
@@ -813,56 +829,59 @@ def download_ifs_control(
 
             date_token = init_dt.strftime("%Y-%m-%d")
             hour_token = init_dt.strftime("%H")
-            request_pl = {
-                "area": area,
-                "class": "od",
-                "date": date_token,
-                "expver": "1",
-                "grid": grid,
-                "levtype": "pl",
-                "levelist": pressure_levels,
-                "param": pressure_level_params,
-                "step": request_step,
-                "stream": "enfo",
-                "expect": "any",
-                "time": hour_token,
-                "type": "cf",
-            }
 
-            logging.debug(
-                "Submitting control pressure request for init %s",
-                init_dt.strftime("%Y-%m-%d %H:%M"),
-            )
+            ds_combined: xr.Dataset | None = None
+            if download_pl:
+                request_pl = {
+                    "area": area,
+                    "class": "od",
+                    "date": date_token,
+                    "expver": "1",
+                    "grid": grid,
+                    "levtype": "pl",
+                    "levelist": pressure_levels,
+                    "param": pressure_level_params,
+                    "step": request_step,
+                    "stream": "enfo",
+                    "expect": "any",
+                    "time": hour_token,
+                    "type": "cf",
+                }
 
-            ds_pressure = earthkit.data.from_source("mars", request_pl, lazily=True)
-            shortnames = list(set(ds_pressure.metadata("shortName")))
-            has_r = "r" in shortnames
-            normal_vars = [var for var in shortnames if var != "r"]
+                logging.debug(
+                    "Submitting control pressure request for init %s",
+                    init_dt.strftime("%Y-%m-%d %H:%M"),
+                )
 
-            ds_normal = ds_pressure.sel(shortName=normal_vars).to_xarray(chunks=chunks_pl)
-            if has_r:
-                ds_special = ds_pressure.sel(shortName=["r"]).to_xarray(chunks=chunks_pl)
-                ds_combined = xr.merge([ds_normal, ds_special])
-            else:
-                ds_combined = ds_normal
+                ds_pressure = earthkit.data.from_source("mars", request_pl, lazily=True)
+                shortnames = list(set(ds_pressure.metadata("shortName")))
+                has_r = "r" in shortnames
+                normal_vars = [var for var in shortnames if var != "r"]
 
-            ds_combined = ds_combined.chunk(chunks_pl).drop_vars("valid_time", errors="ignore")
-            log_ds_summary(f"control.raw.pl.{init_dt:%Y%m%d%H}", ds_combined)
-            ds_combined = rename_and_enrich(
-                ds_combined,
-                init_dt=init_dt,
-            )
-            ds_combined = cast_float32(ds_combined)
-            ds_combined = normalize_longitudes(ds_combined)
-            ds_combined = normalize_latitudes(ds_combined)
-            if debug_small:
-                log_ds_summary(f"control.pl.{init_dt:%Y%m%d%H}", ds_combined)
-            logging.debug(
-                "Control pressure complete %d/%d for init %s",
-                idx,
-                total_inits,
-                init_dt.strftime("%Y-%m-%d %H:%M"),
-            )
+                ds_normal = ds_pressure.sel(shortName=normal_vars).to_xarray(chunks=chunks_pl)
+                if has_r:
+                    ds_special = ds_pressure.sel(shortName=["r"]).to_xarray(chunks=chunks_pl)
+                    ds_combined = xr.merge([ds_normal, ds_special])
+                else:
+                    ds_combined = ds_normal
+
+                ds_combined = ds_combined.chunk(chunks_pl).drop_vars("valid_time", errors="ignore")
+                log_ds_summary(f"control.raw.pl.{init_dt:%Y%m%d%H}", ds_combined)
+                ds_combined = rename_and_enrich(
+                    ds_combined,
+                    init_dt=init_dt,
+                )
+                ds_combined = cast_float32(ds_combined)
+                ds_combined = normalize_longitudes(ds_combined)
+                ds_combined = normalize_latitudes(ds_combined)
+                if debug_small:
+                    log_ds_summary(f"control.pl.{init_dt:%Y%m%d%H}", ds_combined)
+                logging.debug(
+                    "Control pressure complete %d/%d for init %s",
+                    idx,
+                    total_inits,
+                    init_dt.strftime("%Y-%m-%d %H:%M"),
+                )
 
             request_sfc = {
                 "area": area,
@@ -905,7 +924,11 @@ def download_ifs_control(
                 init_dt.strftime("%Y-%m-%d %H:%M"),
             )
 
-            ds_to_write = xr.merge([ds_combined, ds_single], compat="no_conflicts")
+            ds_to_write = (
+                xr.merge([ds_combined, ds_single], compat="no_conflicts")
+                if ds_combined is not None
+                else ds_single
+            )
             target_init = np.array([_datetime_to_np64(init_dt)], dtype="datetime64[ns]")
             if "init_time" not in ds_to_write.dims:
                 ds_to_write = ds_to_write.expand_dims("init_time")
