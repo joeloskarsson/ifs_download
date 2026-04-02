@@ -537,7 +537,7 @@ def download_ifs_ensemble(
                 )
                 existing_init_times = set()
 
-        step_ranges = ["0/1"] if debug_small else [f"{interval}/to/{max_lead_hours}/by/{interval}"]
+        step_ranges = ["0/1"] if debug_small else [f"0/to/{max_lead_hours}/by/{interval}"]
         number_token = "1/to/2/by/1" if debug_small else "1/to/50/by/1"
         total_inits = len(ordered_inits)
 
@@ -791,7 +791,7 @@ def download_ifs_control(
             "longitude": -1,
         }
 
-        request_step = "0/1" if debug_small else f"{interval}/to/{max_lead_hours}/by/{interval}"
+        request_step = "0/1" if debug_small else f"0/to/{max_lead_hours}/by/{interval}"
         existing_init_times = load_existing_init_times(output_file)
         if os.path.exists(output_file):
             try:
