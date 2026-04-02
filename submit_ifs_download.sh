@@ -13,6 +13,7 @@
 #SBATCH --output=logs/ifs_download_main_%j.out  # output log file
 #SBATCH --requeue
 
+cd /capstor/store/cscs/swissai/a122/ojoel/ifs_download
 # Configuration via config.env (single source of truth)
 # You can override the config file path by exporting CONFIG_FILE before sbatch
 #   e.g., CONFIG_FILE=/path/to/config.env sbatch submit_ifs_download.sh
@@ -102,14 +103,6 @@ if [ -n "${DATE_RANGES:-}" ]; then
     IFS=',' read -r -a date_ranges <<< "${DATE_RANGES}"
 else
     date_ranges=(
-        "2023-01-02T00|2023-01-08T23"
-        "2023-04-02T00|2023-04-08T23"
-        "2023-07-02T00|2023-07-08T23"
-        "2023-10-02T00|2023-10-08T23"
-        "2024-01-02T00|2024-01-08T23"
-        "2024-04-02T00|2024-04-08T23"
-        "2024-07-02T00|2024-07-08T23"
-        "2024-10-02T00|2024-10-08T23"
     )
 fi
 
