@@ -11,7 +11,7 @@ from datetime import datetime
 def load_config():
     """Load simple VAR=VALUE pairs from config.env next to this script."""
     cfg = {}
-    cfg_path = os.path.join(os.path.dirname(__file__), "config.env")
+    cfg_path = os.environ.get("CONFIG_FILE") or os.path.join(os.path.dirname(__file__), "config.env")
     try:
         with open(cfg_path, "r") as f:
             for line in f:
